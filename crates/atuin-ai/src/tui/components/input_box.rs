@@ -73,7 +73,7 @@ impl InputBox {
     fn make_block(&self) -> Block<'_> {
         let border_style = Style::default().fg(Color::DarkGray);
         let title_style = Style::default()
-            .fg(Color::White)
+            .fg(Color::Gray)
             .add_modifier(Modifier::BOLD);
 
         let mut block = Block::default()

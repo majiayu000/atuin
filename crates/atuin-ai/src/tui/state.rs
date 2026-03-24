@@ -131,8 +131,6 @@ pub struct AppState {
     pub mode: AppMode,
     /// Conversation events (source of truth, matches API protocol)
     pub events: Vec<ConversationEvent>,
-    /// Text being streamed (accumulated, flushed to Text event on completion)
-    pub streaming_text: String,
     /// Receiver for current input text (sent by InputBox component)
     pub input_rx: watch::Receiver<String>,
     /// Sender for input text (cloned into InputBox component as a prop)
@@ -159,7 +157,6 @@ impl AppState {
         Self {
             mode: AppMode::Input,
             events: Vec::new(),
-            streaming_text: String::new(),
             input_rx,
             input_tx,
             error: None,
@@ -279,9 +276,12 @@ impl AppState {
 
     // ===== Streaming lifecycle methods =====
 
-    /// Start streaming response
+    /// Start streaming response.
+    /// Pushes an empty Text event that will be mutated in-place as chunks arrive.
     pub fn start_streaming(&mut self) {
-        self.streaming_text.clear();
+        self.events.push(ConversationEvent::Text {
+            content: String::new(),
+        });
         self.streaming_status = None;
         self.was_interrupted = false;
         self.mode = AppMode::Streaming;
@@ -297,45 +297,70 @@ impl AppState {
         self.streaming_status = Some(StreamingStatus::from_status_str(status));
     }
 
+    /// Get a mutable reference to the last Text event's content (the streaming buffer).
+    fn streaming_content_mut(&mut self) -> Option<&mut String> {
+        self.events.iter_mut().rev().find_map(|e| {
+            if let ConversationEvent::Text { content } = e {
+                Some(content)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Cancel streaming with context preservation
     pub fn cancel_streaming(&mut self) {
         self.was_interrupted = true;
 
-        let content = std::mem::take(&mut self.streaming_text);
-        let trimmed = content.trim_start();
-        if !trimmed.is_empty() {
-            let interrupted_text = format!("{trimmed}\n\n[User cancelled this generation]");
-            self.events.push(ConversationEvent::Text {
-                content: interrupted_text,
-            });
+        if let Some(content) = self.streaming_content_mut() {
+            let trimmed = content.trim_start().to_string();
+            if trimmed.is_empty() {
+                // Remove the empty text event
+                *content = String::new();
+            } else {
+                *content = format!("{trimmed}\n\n[User cancelled this generation]");
+            }
         }
+        // Remove trailing empty Text events
+        self.remove_empty_trailing_text();
 
         self.streaming_status = None;
         self.confirmation_pending = false;
         self.mode = AppMode::Input;
     }
 
-    /// Append text chunk during streaming
+    /// Append text chunk during streaming (mutates the last Text event in-place)
     pub fn append_streaming_text(&mut self, chunk: &str) {
-        if self.streaming_text.is_empty() {
-            let trimmed = chunk.trim_start();
-            if !trimmed.is_empty() {
-                self.streaming_text.push_str(trimmed);
+        // If the last event isn't a Text, we need a fresh buffer
+        // (e.g. after a tool call removed the empty streaming buffer)
+        if !matches!(self.events.last(), Some(ConversationEvent::Text { .. })) {
+            self.events.push(ConversationEvent::Text {
+                content: String::new(),
+            });
+        }
+
+        if let Some(content) = self.streaming_content_mut() {
+            if content.is_empty() {
+                // First chunk(s): trim leading whitespace
+                let trimmed = chunk.trim_start();
+                if !trimmed.is_empty() {
+                    content.push_str(trimmed);
+                }
+            } else {
+                content.push_str(chunk);
             }
-        } else {
-            self.streaming_text.push_str(chunk);
         }
     }
 
-    /// Add a tool call event during streaming
+    /// Add a tool call event during streaming.
+    /// The current streaming text is already in events, so we just push the tool call.
     pub fn add_tool_call(&mut self, id: String, name: String, input: serde_json::Value) {
-        let content = std::mem::take(&mut self.streaming_text);
-        let trimmed = content.trim_start();
-        if !trimmed.is_empty() {
-            self.events.push(ConversationEvent::Text {
-                content: trimmed.to_string(),
-            });
+        // Trim the streaming text event
+        if let Some(content) = self.streaming_content_mut() {
+            let trimmed = content.trim_start().to_string();
+            *content = trimmed;
         }
+        self.remove_empty_trailing_text();
 
         let is_suggest_command = name == "suggest_command";
         self.events
@@ -356,24 +381,33 @@ impl AppState {
         });
     }
 
-    /// Finalize streaming — flush accumulated text to event
+    /// Finalize streaming — trim the accumulated text and change mode
     pub fn finalize_streaming(&mut self) {
-        let content = std::mem::take(&mut self.streaming_text);
-        let trimmed = content.trim_start();
-        if !trimmed.is_empty() {
-            self.events.push(ConversationEvent::Text {
-                content: trimmed.to_string(),
-            });
+        if let Some(content) = self.streaming_content_mut() {
+            let trimmed = content.trim_start().to_string();
+            *content = trimmed;
         }
+        self.remove_empty_trailing_text();
         self.streaming_status = None;
         self.mode = AppMode::Review;
     }
 
-    /// Streaming error
+    /// Streaming error — remove the partial text event
     pub fn streaming_error(&mut self, error: String) {
-        self.streaming_text.clear();
+        self.remove_empty_trailing_text();
         self.error = Some(error);
         self.mode = AppMode::Error;
+    }
+
+    /// Remove trailing empty Text events from the events list
+    fn remove_empty_trailing_text(&mut self) {
+        while let Some(ConversationEvent::Text { content }) = self.events.last() {
+            if content.is_empty() {
+                self.events.pop();
+            } else {
+                break;
+            }
+        }
     }
 
     // ===== Edit mode and exit methods =====
