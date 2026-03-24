@@ -3,10 +3,7 @@
 //! This module contains the core state types that represent the application's
 //! domain model. Conversation events match the API protocol format.
 
-use std::time::Instant;
-use tui_textarea::TextArea;
-
-use super::spinner::{ACTIVE_SPINNER, active_tick_interval};
+use tokio::sync::watch;
 
 /// Streaming status indicators from server
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +20,7 @@ impl StreamingStatus {
             "processing" => Self::Processing,
             "searching" => Self::Searching,
             "waiting_for_tools" => Self::WaitingForTools,
-            _ => Self::Thinking, // Default to thinking for "thinking" and unknown
+            _ => Self::Thinking,
         }
     }
 
@@ -94,7 +91,6 @@ impl ConversationEvent {
         if let ConversationEvent::ToolCall { name, input, .. } = self
             && name == "suggest_command"
         {
-            // command can be null for pure conversational turns
             return input.get("command").and_then(|v| v.as_str());
         }
         None
@@ -125,10 +121,11 @@ pub enum ExitAction {
     Cancel,
 }
 
-/// Application state - the domain model
+/// Application state — the domain model
 ///
 /// Conversation is stored as a sequence of events matching the API protocol.
-/// The view model is derived from this state via `Blocks::from_state()`.
+/// The view function derives the UI from this state.
+#[derive(Debug)]
 pub struct AppState {
     /// Current application mode
     pub mode: AppMode,
@@ -136,77 +133,61 @@ pub struct AppState {
     pub events: Vec<ConversationEvent>,
     /// Text being streamed (accumulated, flushed to Text event on completion)
     pub streaming_text: String,
-    /// Active text input (uses tui-textarea for proper cursor handling)
-    pub textarea: TextArea<'static>,
-    /// Current error message (renders at end of blocks)
+    /// Receiver for current input text (sent by InputBox component)
+    pub input_rx: watch::Receiver<String>,
+    /// Sender for input text (cloned into InputBox component as a prop)
+    pub input_tx: watch::Sender<String>,
+    /// Current error message
     pub error: Option<String>,
-    /// Whether app should exit
-    pub should_exit: bool,
     /// Exit action (set when exiting)
     pub exit_action: Option<ExitAction>,
-    /// Session ID from server (store after first response, send on subsequent)
+    /// Session ID from server
     pub session_id: Option<String>,
-    /// Current streaming status (for spinner text)
+    /// Current streaming status
     pub streaming_status: Option<StreamingStatus>,
     /// Whether current turn was interrupted by user
     pub was_interrupted: bool,
-    /// Spinner animation state
-    pub spinner_frame: usize,
-    /// When spinner frame last advanced (for timing control)
-    pub last_spinner_tick: Instant,
-    /// When streaming started (for spinner delay)
-    pub streaming_started: Option<Instant>,
     /// True when user has pressed Enter once on a dangerous command
     pub confirmation_pending: bool,
-}
-
-/// Create a TextArea with our preferred configuration
-fn create_textarea() -> TextArea<'static> {
-    let mut textarea = TextArea::default();
-    // Disable underline on cursor line - it's distracting
-    textarea.set_cursor_line_style(ratatui::style::Style::default());
-    // Enable word wrapping
-    textarea.set_wrap_mode(tui_textarea::WrapMode::Word);
-    textarea
+    /// True when the app is about to exit (hides the input box on final render)
+    pub exiting: bool,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let (input_tx, input_rx) = watch::channel(String::new());
         Self {
             mode: AppMode::Input,
             events: Vec::new(),
             streaming_text: String::new(),
-            textarea: create_textarea(),
+            input_rx,
+            input_tx,
             error: None,
-            should_exit: false,
             exit_action: None,
             session_id: None,
             streaming_status: None,
             was_interrupted: false,
-            spinner_frame: 0,
-            last_spinner_tick: Instant::now(),
-            streaming_started: None,
             confirmation_pending: false,
+            exiting: false,
         }
     }
 
-    /// Get the current input text
+    /// Get the submitted input text (sent by InputBox on Enter)
     pub fn input(&self) -> String {
-        self.textarea.lines().join("\n")
+        self.input_rx.borrow().clone()
     }
 
-    /// Check if input is empty
+    /// Check if the submitted input is empty
     pub fn input_is_empty(&self) -> bool {
-        self.textarea.is_empty()
+        self.input_rx.borrow().trim().is_empty()
     }
 
-    /// Clear the input
+    /// Reset the input channel (after consuming the submitted text)
     pub fn clear_input(&mut self) {
-        self.textarea = create_textarea();
+        let _ = self.input_tx.send(String::new());
     }
 
     /// Convert conversation events to Claude API message format
-    /// Groups consecutive tool calls, handles role alternation
     pub fn events_to_messages(&self) -> Vec<serde_json::Value> {
         let mut messages = Vec::new();
         let mut i = 0;
@@ -229,7 +210,6 @@ impl AppState {
                     i += 1;
                 }
                 ConversationEvent::ToolCall { .. } => {
-                    // Group consecutive tool calls into single assistant message
                     let mut tool_uses = Vec::new();
                     while i < events.len() {
                         if let ConversationEvent::ToolCall { id, name, input } = &events[i] {
@@ -275,55 +255,11 @@ impl AppState {
 
     /// Start generating from current input
     pub fn start_generating(&mut self) {
-        // Add user message event
         self.events.push(ConversationEvent::UserMessage {
             content: self.input(),
         });
-
-        // Clear input, switch mode
         self.clear_input();
         self.mode = AppMode::Generating;
-    }
-
-    /// Generation complete with command (legacy method, kept for compatibility)
-    pub fn generation_complete(
-        &mut self,
-        command: String,
-        explanation: Option<String>,
-        dangerous: bool,
-        warnings: Vec<String>,
-    ) {
-        // Add explanation as text event if present
-        if let Some(ref exp) = explanation {
-            self.events.push(ConversationEvent::Text {
-                content: exp.clone(),
-            });
-        }
-
-        // Add tool_call event for suggest_command
-        let tool_id = format!("gen_{}", uuid::Uuid::new_v4().simple());
-        let mut tool_input = serde_json::json!({
-            "command": command,
-            "conversation_only": false,
-            "confidence": "high"
-        });
-        if let Some(ref exp) = explanation {
-            tool_input["message"] = serde_json::json!(exp);
-        }
-        if dangerous {
-            tool_input["danger"] = serde_json::json!("high");
-        }
-        if !warnings.is_empty() {
-            tool_input["warning"] = serde_json::json!(warnings.join("; "));
-        }
-
-        self.events.push(ConversationEvent::ToolCall {
-            id: tool_id,
-            name: "suggest_command".to_string(),
-            input: tool_input,
-        });
-
-        self.mode = AppMode::Review;
     }
 
     /// Generation error occurred
@@ -334,7 +270,6 @@ impl AppState {
 
     /// Cancel during generation
     pub fn cancel_generation(&mut self) {
-        // Remove the last user message since generation was cancelled
         if let Some(ConversationEvent::UserMessage { .. }) = self.events.last() {
             self.events.pop();
         }
@@ -349,7 +284,6 @@ impl AppState {
         self.streaming_text.clear();
         self.streaming_status = None;
         self.was_interrupted = false;
-        self.streaming_started = Some(Instant::now());
         self.mode = AppMode::Streaming;
     }
 
@@ -365,11 +299,8 @@ impl AppState {
 
     /// Cancel streaming with context preservation
     pub fn cancel_streaming(&mut self) {
-        // Mark as interrupted
         self.was_interrupted = true;
 
-        // Flush partial text with interruption marker if any
-        // Trim leading whitespace since LLM responses often start with \n\n
         let content = std::mem::take(&mut self.streaming_text);
         let trimmed = content.trim_start();
         if !trimmed.is_empty() {
@@ -379,32 +310,25 @@ impl AppState {
             });
         }
 
-        // Clear status and return to input
         self.streaming_status = None;
         self.confirmation_pending = false;
         self.mode = AppMode::Input;
     }
 
     /// Append text chunk during streaming
-    /// Trims leading whitespace from the first chunk(s) since LLM responses often start with \n\n
     pub fn append_streaming_text(&mut self, chunk: &str) {
         if self.streaming_text.is_empty() {
-            // First chunk(s): trim leading whitespace
             let trimmed = chunk.trim_start();
             if !trimmed.is_empty() {
                 self.streaming_text.push_str(trimmed);
             }
         } else {
-            // Subsequent chunks: append as-is
             self.streaming_text.push_str(chunk);
         }
     }
 
     /// Add a tool call event during streaming
-    /// Flushes any pending streaming text first to maintain correct event order
-    /// For suggest_command, also transitions to Review mode since that ends the LLM turn
     pub fn add_tool_call(&mut self, id: String, name: String, input: serde_json::Value) {
-        // Flush streaming text before adding tool call to maintain correct order
         let content = std::mem::take(&mut self.streaming_text);
         let trimmed = content.trim_start();
         if !trimmed.is_empty() {
@@ -413,15 +337,12 @@ impl AppState {
             });
         }
 
-        // suggest_command marks the end of the LLM turn - transition to Review
         let is_suggest_command = name == "suggest_command";
-
         self.events
             .push(ConversationEvent::ToolCall { id, name, input });
 
         if is_suggest_command {
             self.streaming_status = None;
-            self.streaming_started = None;
             self.mode = AppMode::Review;
         }
     }
@@ -435,10 +356,8 @@ impl AppState {
         });
     }
 
-    /// Finalize streaming - flush accumulated text to event
+    /// Finalize streaming — flush accumulated text to event
     pub fn finalize_streaming(&mut self) {
-        // Flush streaming text to a Text event if non-empty
-        // Trim leading whitespace since LLM responses often start with \n\n
         let content = std::mem::take(&mut self.streaming_text);
         let trimmed = content.trim_start();
         if !trimmed.is_empty() {
@@ -447,15 +366,12 @@ impl AppState {
             });
         }
         self.streaming_status = None;
-        self.streaming_started = None;
         self.mode = AppMode::Review;
     }
 
     /// Streaming error
     pub fn streaming_error(&mut self, error: String) {
-        // Discard any partial streaming text
         self.streaming_text.clear();
-        self.streaming_started = None;
         self.error = Some(error);
         self.mode = AppMode::Error;
     }
@@ -469,38 +385,20 @@ impl AppState {
         self.mode = AppMode::Input;
     }
 
-    /// Exit with action
-    pub fn exit(&mut self, action: ExitAction) {
-        self.exit_action = Some(action);
-        self.should_exit = true;
-    }
-
     /// Retry after error
     pub fn retry(&mut self) {
         self.error = None;
         self.mode = AppMode::Generating;
     }
 
-    // ===== Utility methods =====
-
-    /// Advance spinner frame if enough time has passed
-    /// Called on every event loop tick (50ms), but only advances spinner
-    /// when the active spinner's interval has elapsed
-    pub fn tick(&mut self) {
-        let interval = active_tick_interval();
-        if self.last_spinner_tick.elapsed() >= interval {
-            self.spinner_frame = (self.spinner_frame + 1) % ACTIVE_SPINNER.frame_count();
-            self.last_spinner_tick = Instant::now();
-        }
-    }
+    // ===== Query methods =====
 
     /// Get the most recent command from events
     pub fn current_command(&self) -> Option<&str> {
         self.events.iter().rev().find_map(|e| e.as_command())
     }
 
-    /// Check if the most recent command suggestion is marked dangerous
-    /// Checks the `danger` field for "high", "medium", or "med" values
+    /// Check if the most recent command is marked dangerous
     pub fn is_current_command_dangerous(&self) -> bool {
         self.events
             .iter()
@@ -520,6 +418,67 @@ impl AppState {
                 None
             })
             .unwrap_or(false)
+    }
+
+    /// Count non-suggest_command tool calls since the last user message
+    pub fn tool_count_since_last_user(&self) -> usize {
+        let last_user_idx = self
+            .events
+            .iter()
+            .rposition(|e| matches!(e, ConversationEvent::UserMessage { .. }))
+            .unwrap_or(0);
+
+        let mut completed = 0;
+        let mut in_flight = false;
+
+        for event in &self.events[last_user_idx..] {
+            match event {
+                ConversationEvent::ToolCall { name, .. } if name != "suggest_command" => {
+                    if in_flight {
+                        completed += 1;
+                    }
+                    in_flight = true;
+                }
+                ConversationEvent::ToolResult { .. } => {
+                    if in_flight {
+                        completed += 1;
+                        in_flight = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        completed
+    }
+
+    /// Check if any turn in the conversation has a command
+    pub fn has_any_command(&self) -> bool {
+        self.events.iter().any(|e| {
+            if let ConversationEvent::ToolCall { name, input, .. } = e {
+                name == "suggest_command" && input.get("command").and_then(|v| v.as_str()).is_some()
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Get the footer text for current mode
+    pub fn footer_text(&self) -> &'static str {
+        match self.mode {
+            AppMode::Input => "[Enter] Send  [Esc] Exit",
+            AppMode::Generating | AppMode::Streaming => "[Esc] Cancel",
+            AppMode::Review => {
+                if self.confirmation_pending {
+                    "[Enter] Confirm dangerous command  [Esc] Cancel"
+                } else if self.has_any_command() {
+                    "[Enter] Execute  [Tab] Insert  [f] Follow-up  [Esc] Exit"
+                } else {
+                    "[f] Follow-up  [Esc] Exit"
+                }
+            }
+            AppMode::Error => "[Enter]/[r] Retry  [Esc] Exit",
+        }
     }
 }
 
