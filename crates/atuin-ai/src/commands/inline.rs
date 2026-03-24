@@ -366,7 +366,7 @@ async fn run_inline_tui(
     initial_prompt: Option<String>,
     settings: &atuin_client::settings::Settings,
 ) -> Result<Action> {
-    let mut initial_state = AppState::new();
+    let initial_state = AppState::new();
     if let Some(prompt) = initial_prompt {
         let _ = initial_state.input_tx.send(prompt);
     }
@@ -399,7 +399,7 @@ async fn run_inline_tui(
 
         // Helper: set exit action and mark as exiting so the final render
         // hides the input box, leaving only conversation content visible.
-        let mut do_exit = |state: &mut AppState, action: ExitAction| -> ControlFlow {
+        let do_exit = |state: &mut AppState, action: ExitAction| -> ControlFlow {
             state.exit_action = Some(action);
             state.exiting = true;
             ControlFlow::Exit

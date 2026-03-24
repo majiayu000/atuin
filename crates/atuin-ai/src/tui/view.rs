@@ -198,6 +198,9 @@ impl TurnBuilder {
 
     fn build(&mut self) -> Vec<UiTurn> {
         self.commit_turn();
+
+        // TODO: collapse multiple tool calls into a ToolSummary
+
         std::mem::take(&mut self.turns)
     }
 }
