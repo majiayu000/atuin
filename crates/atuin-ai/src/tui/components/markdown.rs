@@ -138,7 +138,7 @@ fn parse_markdown<'a>(source: &'a str, styles: &'a MarkdownStyles) -> Text<'stat
                 }
             }
             Event::Code(code) => {
-                lines[current_line].push(Span::styled(format!("`{}`", code), styles.code_inline));
+                lines[current_line].push(Span::styled(format!("{}", code), styles.code_inline));
             }
             Event::Text(text) => {
                 let current_style = if in_code_block {
