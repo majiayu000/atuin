@@ -371,6 +371,8 @@ async fn run_inline_tui(
         let _ = initial_state.input_tx.send(prompt);
     }
 
+    println!();
+
     let (mut app, handle) = Application::builder()
         .state(initial_state)
         .view(ai_view)

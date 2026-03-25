@@ -6,6 +6,8 @@
 //!
 //! Text changes are communicated back to the app via a `tokio::sync::watch` channel.
 
+use std::sync::Mutex;
+
 use crossterm::event::KeyModifiers;
 use eye_declare::{Component, EventResult, Hooks};
 use ratatui::widgets::{Block, Borders, Padding};
@@ -50,7 +52,7 @@ impl Default for InputBox {
 }
 
 pub struct InputBoxState {
-    textarea: TextArea<'static>,
+    textarea: Mutex<TextArea<'static>>,
 }
 
 impl Default for InputBoxState {
@@ -64,7 +66,9 @@ impl Default for InputBoxState {
                 .fg(ratatui::style::Color::DarkGray)
                 .add_modifier(ratatui::style::Modifier::ITALIC),
         );
-        Self { textarea }
+        Self {
+            textarea: Mutex::new(textarea),
+        }
     }
 }
 
@@ -125,20 +129,28 @@ impl Component for InputBox {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        let mut textarea = state.textarea.lock().unwrap();
+        if self.active {
+            textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+            textarea.set_placeholder_text("Type a message...");
+        } else {
+            textarea.set_cursor_style(Style::default());
+            textarea.set_placeholder_text("");
+        }
+
         // Render textarea into the inner area
-        (&state.textarea).render(inner, buf);
+        textarea.render(inner, buf);
     }
 
     fn desired_height(&self, width: u16, state: &Self::State) -> u16 {
         if width < 4 {
             return 3;
         }
-        // Use logical line count + chrome as the height.
         // TextArea handles scrolling internally if content overflows.
         let block = self.make_block();
         let inner = block.inner(Rect::new(0, 0, width, u16::MAX));
         let chrome = (u16::MAX).saturating_sub(inner.height);
-        let content = state.textarea.clone().measure(width - 4);
+        let content = state.textarea.lock().unwrap().measure(width - 4);
         chrome + content.preferred_rows
     }
 
@@ -160,21 +172,23 @@ impl Component for InputBox {
                 return EventResult::Ignored;
             }
 
+            let mut textarea = state.textarea.lock().unwrap();
+
             match key.code {
                 crossterm::event::KeyCode::Char('j')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    state.textarea.insert_newline();
+                    textarea.insert_newline();
                     return EventResult::Consumed;
                 }
                 crossterm::event::KeyCode::Enter => {
                     if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        state.textarea.insert_char('!');
+                        textarea.insert_char('!');
                         return EventResult::Consumed;
                     } else {
                         // Send current text to app, then bubble up for app to act on
-                        let _ = self.tx.send(state.textarea.lines().join("\n"));
-                        state.textarea.clear();
+                        let _ = self.tx.send(textarea.lines().join("\n"));
+                        textarea.clear();
                         return EventResult::Ignored;
                     }
                 }
@@ -187,7 +201,7 @@ impl Component for InputBox {
 
             // All other keys: forward to textarea
             if let Some(input) = tui_textarea_input_from_key(key) {
-                state.textarea.input(input);
+                textarea.input(input);
                 return EventResult::Consumed;
             }
         }
